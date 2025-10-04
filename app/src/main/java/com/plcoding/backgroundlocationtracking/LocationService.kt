@@ -1,12 +1,13 @@
 package com.plcoding.backgroundlocationtracking
 
-import android.app.NotificationChannel
+import android.app.Notification
 import android.app.NotificationManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
@@ -16,6 +17,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import com.google.android.gms.location.LocationServices
+import com.plcoding.backgroundlocationtracking.admin.PolicyManager
 import com.plcoding.backgroundlocationtracking.data.LocationRepository
 import com.plcoding.backgroundlocationtracking.worker.LocationSyncWorker
 import kotlinx.coroutines.*
@@ -28,154 +30,175 @@ class LocationService : Service() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var locationClient: LocationClient
     private lateinit var repository: LocationRepository
+    private lateinit var policyManager: PolicyManager
+    private var locationJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        Log.d("LocationService", "🚀 Service created")
+        Log.d("LocationService", "🚀 Service created | hashCode=${this.hashCode()}")
+
         locationClient = DefaultLocationClient(
             applicationContext,
             LocationServices.getFusedLocationProviderClient(applicationContext)
         )
+
         repository = LocationRepository(applicationContext)
+        policyManager = PolicyManager(this)
 
-        createNotificationChannel()
-
-        // ✅ Thử sync pending ngay khi service khởi động
+        // Sync pending locations ngay khi service start
         serviceScope.launch {
             try {
-                Log.d("LocationService", "🔄 Trying to sync pending locations on service start...")
+                Log.d("LocationService", "🔄 Sync pending locations on service start...")
                 repository.syncPendingLocations()
-                Log.d("LocationService", "✅ Pending locations synced on service start")
+                Log.d("LocationService", "✅ Pending locations synced")
             } catch (e: Exception) {
                 Log.e("LocationService", "❌ Failed to sync pending locations", e)
                 enqueueSyncWorker()
             }
         }
+
+        // Ép các policy nếu Device Owner
+        if (policyManager.isAdminActive()) {
+            try {
+                policyManager.blockUninstall(true)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    policyManager.blockLocationPermissionChanges()
+                }
+                policyManager.enforceLocationPolicy()
+                Log.d("LocationService", "✅ Device Owner policies enforced")
+            } catch (e: Exception) {
+                Log.e("LocationService", "❌ Failed to enforce policies", e)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.d("LocationService", "▶️ onStartCommand called with action=${intent?.action}")
+        Log.d("LocationService", "▶️ onStartCommand | action=${intent?.action}, startId=$startId")
+
         when (intent?.action) {
-            ACTION_START -> startTracking()
+            ACTION_START -> {
+                // Lấy userName từ intent hoặc SharedPreferences
+                val userName = intent.getStringExtra("userName")
+                    ?: getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+                        .getString("userName", "unknown_user")
+                    ?: "unknown_user"
+
+                startTracking(userName)
+            }
             ACTION_STOP -> stopTracking()
             else -> Log.w("LocationService", "⚠️ Unknown action received: ${intent?.action}")
         }
         return START_STICKY
     }
 
-    private fun startTracking() {
-        Log.d("LocationService", "📍 Start tracking location...")
-        val notification = NotificationCompat.Builder(this, "location")
-            .setContentTitle("Tracking location...")
-            .setContentText("Location: null")
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setOngoing(true)
+    private fun startTracking(userName: String) {
+        if (locationJob != null) return
 
-        val notificationManager =
-            getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        Log.d("LocationService", "📍 Start tracking location for user=$userName")
 
-        locationClient.getLocationUpdates(5000L)
-            .catch { e ->
-                Log.e("LocationService", "❌ Error while receiving location updates", e)
-            }
+        val silentNotification = createSilentNotification()
+
+        locationJob = locationClient.getLocationUpdates(5000L)
+            .catch { e -> Log.e("LocationService", "❌ Error receiving location", e) }
             .onEach { location ->
                 val lat = location.latitude
                 val lon = location.longitude
-                Log.d("LocationService", "📍 Got location update: latitude=$lat, longitude=$lon")
+                Log.d("LocationService", "📍 Got location update: lat=$lat, lon=$lon")
 
-                // Update notification
-                val updatedNotification = notification.setContentText(
-                    "Location: (${"%.5f".format(lat)}, ${"%.5f".format(lon)})"
-                )
-                notificationManager.notify(1, updatedNotification.build())
-
-                // Broadcast to UI
-                sendLocationToUI(lat, lon)
-
-                // Save or upload location
-                uploadOrSaveLocation(lat, lon)
+                sendLocationToUI(lat, lon, userName)
+                uploadOrSaveLocation(lat, lon, userName)
             }
             .launchIn(serviceScope)
 
-        startForeground(1, notification.build())
-        Log.d("LocationService", "✅ Foreground service started")
+        startForeground(NOTIFICATION_ID, silentNotification)
+        Log.d("LocationService", "✅ Foreground service started (silent notify)")
     }
 
-    private fun sendLocationToUI(lat: Double, lon: Double) {
-        Log.d("LocationService", "📤 Sending location to UI: $lat,$lon")
-        val intent = Intent("LOCATION_UPDATE")
-        intent.putExtra("latitude", lat)
-        intent.putExtra("longitude", lon)
+    private fun sendLocationToUI(lat: Double, lon: Double, userName: String) {
+        val intent = Intent("LOCATION_UPDATE").apply {
+            putExtra("latitude", lat)
+            putExtra("longitude", lon)
+            putExtra("userName", userName)
+        }
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
+        Log.d("LocationService", "📤 Sent broadcast: lat=$lat, lon=$lon, user=$userName")
     }
 
-    private fun uploadOrSaveLocation(lat: Double, lon: Double) {
+    private fun uploadOrSaveLocation(lat: Double, lon: Double, userName: String) {
         serviceScope.launch {
             try {
                 val timestamp = System.currentTimeMillis()
-                Log.d("LocationService", "💾 Handling location -> saveOrUpload: $lat,$lon,$timestamp")
-                repository.saveOrUploadLocation(lat, lon, timestamp)
-                Log.d("LocationService", "✅ Location handled (uploaded or saved): $lat,$lon,$timestamp")
+                val deviceId = Settings.Secure.getString(
+                    applicationContext.contentResolver,
+                    Settings.Secure.ANDROID_ID
+                )
+
+                repository.saveOrUploadLocation(lat, lon, timestamp, deviceId, userName)
+                Log.d("LocationService", "💾 Location saved/uploaded: lat=$lat, lon=$lon, user=$userName")
 
                 enqueueSyncWorker()
             } catch (e: Exception) {
-                Log.e("LocationService", "❌ Failed to handle location", e)
+                Log.e("LocationService", "❌ Failed to save/upload location", e)
                 enqueueSyncWorker()
             }
         }
     }
 
     private fun stopTracking() {
+        locationJob?.cancel()
+        locationJob = null
         stopForeground(true)
         stopSelf()
-        Log.d("LocationService", "🛑 Tracking stopped, service stopped")
+        Log.d("LocationService", "🛑 Tracking stopped")
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        locationJob?.cancel()
         serviceScope.cancel()
-        Log.d("LocationService", "💀 Service destroyed and coroutine scope cancelled")
-    }
-
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                "location",
-                "Location Tracking",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
-            Log.d("LocationService", "🔔 Notification channel created")
-        }
+        Log.d("LocationService", "💀 Service destroyed")
     }
 
     /**
-     * Worker sẽ sync pending locations khi có mạng trở lại
+     * 🔇 Notification ẩn (silent, dùng channel "location" đã tạo trong LocationApp)
      */
+    private fun createSilentNotification(): Notification {
+        return NotificationCompat.Builder(this, "location")
+            .setSmallIcon(R.drawable.ic_notification_placeholder) // icon trong suốt 1x1
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .setSilent(true)
+            .setOngoing(true) // giữ notification như service bắt buộc
+            .build()
+    }
+
     private fun enqueueSyncWorker() {
-        Log.d("LocationService", "📌 Enqueuing sync worker with NetworkType.CONNECTED")
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build()
 
         val request = OneTimeWorkRequestBuilder<LocationSyncWorker>()
             .setConstraints(constraints)
+            .setBackoffCriteria(
+                androidx.work.BackoffPolicy.EXPONENTIAL,
+                15,
+                java.util.concurrent.TimeUnit.MINUTES
+            )
             .build()
 
         WorkManager.getInstance(applicationContext).enqueueUniqueWork(
             "LocationSyncWork",
-            ExistingWorkPolicy.KEEP, // giữ worker cũ, không enqueue thêm nếu đang chạy
+            ExistingWorkPolicy.KEEP,
             request
         )
-
-        Log.d("LocationService", "✅ Unique SyncWorker enqueued (will sync when online)")
+        Log.d("LocationService", "✅ SyncWorker enqueued id=${request.id}")
     }
 
     companion object {
         const val ACTION_START = "ACTION_START"
         const val ACTION_STOP = "ACTION_STOP"
+        private const val NOTIFICATION_ID = 1
     }
 }

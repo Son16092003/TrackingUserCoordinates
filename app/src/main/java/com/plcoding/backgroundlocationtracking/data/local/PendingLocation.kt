@@ -8,5 +8,7 @@ data class PendingLocation(
     @PrimaryKey(autoGenerate = true) val id: Int = 0,
     val latitude: Double,
     val longitude: Double,
-    val timestamp: Long
+    val timestamp: Long,
+    val deviceId : String,
+    val userName: String
 )

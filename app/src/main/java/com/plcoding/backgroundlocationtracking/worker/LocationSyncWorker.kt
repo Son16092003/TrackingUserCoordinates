@@ -15,26 +15,27 @@ class LocationSyncWorker(
     private val repository = LocationRepository(context)
 
     override suspend fun doWork(): Result {
-        Log.d("LocationSyncWorker", "Worker started: syncing pending locations...")
+        Log.d("LocationSyncWorker", "🚀 Worker started id=$id: syncing pending locations...")
 
         return try {
             val success = repository.syncPendingLocations()
 
             if (success) {
-                Log.d("LocationSyncWorker", "Worker finished: sync success ✅")
+                Log.d("LocationSyncWorker", "✅ Worker finished: sync success (id=$id)")
                 Result.success()
             } else {
-                Log.w("LocationSyncWorker", "Some locations not synced (temporary issue), will retry")
-                Result.retry() // Lỗi tạm thời -> retry
+                Log.w("LocationSyncWorker", "⚠️ Some locations not synced (temporary issue), will retry (id=$id)")
+                Result.retry()
             }
         } catch (e: IOException) {
-            // 👉 Lỗi mạng (mất mạng, timeout) => retry
-            Log.e("LocationSyncWorker", "Network error, will retry later 🌐", e)
+            // 👉 Lỗi mạng (mất mạng, timeout) => retry với backoff
+            Log.e("LocationSyncWorker", "🌐 Network error, will retry later (id=$id)", e)
             Result.retry()
         } catch (e: Exception) {
-            // 👉 Lỗi khác (thường là lỗi 4xx do dữ liệu sai) => không retry nữa
-            Log.e("LocationSyncWorker", "Unrecoverable error, will fail ❌", e)
+            // 👉 Lỗi khác (thường là 4xx) => không retry nữa
+            Log.e("LocationSyncWorker", "❌ Unrecoverable error, will fail (id=$id)", e)
             Result.failure()
         }
     }
 }
+

