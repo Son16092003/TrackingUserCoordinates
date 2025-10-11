@@ -3,66 +3,143 @@ package com.plcoding.backgroundlocationtracking
 import android.annotation.SuppressLint
 import android.content.Context
 import android.location.Location
+import android.location.LocationListener
 import android.location.LocationManager
+import android.os.Build
+import android.os.Bundle
 import android.os.Looper
-import com.google.android.gms.location.FusedLocationProviderClient
-import com.google.android.gms.location.LocationCallback
-import com.google.android.gms.location.LocationRequest
-import com.google.android.gms.location.LocationResult
+import android.util.Log
+import com.google.android.gms.location.*
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 
-// Class này triển khai interface LocationClient
 class DefaultLocationClient(
-    private val context: Context,                           // Ngữ cảnh Android
-    private val client: FusedLocationProviderClient         // Google fused location API client
-): LocationClient {
+    private val context: Context,
+    private val client: FusedLocationProviderClient
+) : LocationClient {
 
-    @SuppressLint("MissingPermission") // Bỏ cảnh báo vì ta đã kiểm tra permission thủ công
-    override fun getLocationUpdates(interval: Long): Flow<Location> {
-        // Trả về một Flow phát ra liên tục vị trí mới
-        return callbackFlow {
-            // --- Kiểm tra quyền truy cập vị trí ---
-            if(!context.hasLocationPermission()) {
-                throw LocationClient.LocationException("Missing location permission")
-            }
+    companion object {
+        private const val TAG = "DefaultLocationClient"
+    }
 
-            // --- Kiểm tra GPS/Network có bật không ---
-            val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
-            val isGpsEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
-            val isNetworkEnabled = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
-            if(!isGpsEnabled && !isNetworkEnabled) {
-                throw LocationClient.LocationException("GPS is disabled")
-            }
+    @SuppressLint("MissingPermission")
+    override fun getLocationUpdates(interval: Long): Flow<Location> = callbackFlow {
+        Log.d(TAG, "🚀 getLocationUpdates() called with interval=${interval}ms")
 
-            // --- Tạo yêu cầu lấy vị trí ---
-            val request = LocationRequest.create()
-                .setInterval(interval)          // Thời gian lấy vị trí (ms)
-                .setFastestInterval(interval)   // Khoảng nhanh nhất có thể lấy
+        // --- Kiểm tra quyền location ---
+        val hasFine = context.hasFineLocationPermission()
+        val hasCoarse = context.hasCoarseLocationPermission()
+        val hasBackground = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            context.hasBackgroundLocationPermission() else true
 
-            // --- Callback khi có kết quả vị trí mới ---
+        Log.d(TAG, "🔍 ACCESS_FINE_LOCATION: ${if (hasFine) "✅ GRANTED" else "❌ DENIED"}")
+        Log.d(TAG, "🔍 ACCESS_COARSE_LOCATION: ${if (hasCoarse) "✅ GRANTED" else "❌ DENIED"}")
+        Log.d(TAG, "🔍 ACCESS_BACKGROUND_LOCATION: ${if (hasBackground) "✅ GRANTED" else "❌ DENIED"}")
+
+        if (!context.hasLocationPermission()) {
+            throw LocationClient.LocationException("Missing location permission")
+        }
+
+        // --- Kiểm tra trạng thái GPS / Network ---
+        val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        val isGpsEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+        val isNetworkEnabled = locationManager.isProviderEnabled(LocationManager.NETWORK_PROVIDER)
+
+        Log.d(TAG, "📡 GPS Provider: ${if (isGpsEnabled) "✅ Enabled" else "❌ Disabled"}")
+        Log.d(TAG, "🌐 Network Provider: ${if (isNetworkEnabled) "✅ Enabled" else "❌ Disabled"}")
+
+        if (!isGpsEnabled && !isNetworkEnabled) {
+            throw LocationClient.LocationException("GPS is disabled")
+        }
+
+        // --- API >= 29: Dùng FusedLocationProviderClient ---
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Log.d(TAG, "📱 Using FusedLocationProviderClient (API ≥ 29)")
+
+            val request = LocationRequest.Builder(interval)
+                .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
+                .setWaitForAccurateLocation(false)
+                .setMinUpdateIntervalMillis(interval)
+                .build()
+
             val locationCallback = object : LocationCallback() {
                 override fun onLocationResult(result: LocationResult) {
-                    super.onLocationResult(result)
                     result.locations.lastOrNull()?.let { location ->
-                        // Gửi vị trí mới vào Flow
+                        Log.d(TAG, "📍 [Fused] lat=${location.latitude}, lon=${location.longitude}")
                         launch { send(location) }
                     }
                 }
+
+                override fun onLocationAvailability(p0: LocationAvailability) {
+                    Log.d(TAG, "📶 Location availability: ${p0.isLocationAvailable}")
+                }
             }
 
-            // --- Đăng ký cập nhật vị trí ---
             client.requestLocationUpdates(
-                request,                        // Yêu cầu vị trí
-                locationCallback,               // Callback nhận kết quả
-                Looper.getMainLooper()          // Chạy trên luồng chính
+                request,
+                locationCallback,
+                Looper.getMainLooper()
             )
+            Log.d(TAG, "✅ Location updates started with FusedLocationProviderClient")
 
-            // --- Khi Flow bị đóng, hủy đăng ký để tiết kiệm pin ---
             awaitClose {
+                Log.d(TAG, "🧹 Removing FusedLocationProviderClient updates")
                 client.removeLocationUpdates(locationCallback)
+            }
+
+        } else {
+            // --- API 23–28: fallback sang LocationManager ---
+            Log.d(TAG, "📱 Using LocationManager fallback (API 23–28)")
+
+            val listener = object : LocationListener {
+                override fun onLocationChanged(location: Location) {
+                    Log.d(TAG, "📍 [Legacy] lat=${location.latitude}, lon=${location.longitude}")
+                    launch { send(location) }
+                }
+
+                @Deprecated("Deprecated in Java")
+                override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+                override fun onProviderEnabled(provider: String) {
+                    Log.d(TAG, "✅ Provider enabled: $provider")
+                }
+                override fun onProviderDisabled(provider: String) {
+                    Log.w(TAG, "⚠️ Provider disabled: $provider")
+                }
+            }
+
+            try {
+                if (isGpsEnabled) {
+                    locationManager.requestLocationUpdates(
+                        LocationManager.GPS_PROVIDER,
+                        interval,
+                        5f, // tránh gửi liên tục quá nhanh
+                        listener,
+                        Looper.getMainLooper()
+                    )
+                    Log.d(TAG, "✅ GPS provider registered for updates")
+                } else if (isNetworkEnabled) {
+                    locationManager.requestLocationUpdates(
+                        LocationManager.NETWORK_PROVIDER,
+                        interval,
+                        10f,
+                        listener,
+                        Looper.getMainLooper()
+                    )
+                    Log.d(TAG, "✅ Network provider registered for updates")
+                }
+            } catch (e: SecurityException) {
+                Log.e(TAG, "❌ Missing location permission", e)
+                throw LocationClient.LocationException("Missing location permission")
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Failed to request location updates: ${e.message}", e)
+                throw LocationClient.LocationException("Failed to request location updates: ${e.message}")
+            }
+
+            awaitClose {
+                Log.d(TAG, "🧹 Removing LocationManager updates")
+                locationManager.removeUpdates(listener)
             }
         }
     }
