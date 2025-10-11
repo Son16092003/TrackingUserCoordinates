@@ -2,6 +2,29 @@ import { startIcon, pauseIcon, liveIcon, endIcon } from "./icons.js";
 import { devices, getColorFromId, updateDeviceList } from "./devices.js";
 
 export let summaryMarkers = [];
+export let detailedMarkers = [];
+
+// Helper: parse various timestamp representations into a Date
+function parseTimestamp(ts) {
+  if (ts instanceof Date) return ts;
+  if (ts === null || ts === undefined) return new Date();
+  if (typeof ts === 'number') return new Date(ts);
+  const s = String(ts).trim();
+  if (/^\d+$/.test(s)) return new Date(Number(s));
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return d;
+  return new Date();
+}
+
+// Helper: formatted timestamp for popup
+function formatTimestamp(ts) {
+  const d = parseTimestamp(ts);
+  try {
+    return d.toLocaleString('vi-VN');
+  } catch (e) {
+    return d.toString();
+  }
+}
 
 // Debounce timer cho việc fit map
 let fitMapTimer = null;
@@ -85,9 +108,8 @@ export function addLivePoint(deviceId, lat, lon, timestamp, userName, map) {
     clearInterval(device.liveTimer);
   }
 
-  const marker = L.marker([lat, lon], { icon: liveIcon }).bindPopup(
-    `📡 ${deviceId}<br>${time.toLocaleString("vi-VN")}`
-  );
+  const popupContentLive = `📡 ${userName ? userName + ' — ' : ''}${deviceId}<br>${formatTimestamp(time)}`;
+  const marker = L.marker([lat, lon], { icon: liveIcon }).bindPopup(popupContentLive);
 
   if (device.visible) marker.addTo(map);
   device.liveMarker = marker;
@@ -133,6 +155,10 @@ export function addLivePoint(deviceId, lat, lon, timestamp, userName, map) {
 
   // Thêm trail
   const trailMarker = L.circleMarker([lat, lon], { radius: 4, color });
+  // Bind popup to trail markers showing deviceId and timestamp (no userName for historical trail here)
+  try {
+    trailMarker.bindPopup(`${deviceId}<br>${formatTimestamp(time)}`);
+  } catch (e) { /* ignore */ }
   if (device.visible) trailMarker.addTo(map);
   device.trailMarkers.push(trailMarker);
 
@@ -159,41 +185,131 @@ export function addSummaryPoints(deviceId, coords, map) {
     clearInterval(device.liveTimer);
   }
 
-  device.coords = coords.map((c) => ({
-    lat: c.latitude,
-    lon: c.longitude,
-    timestamp: new Date(Number(c.timestamp)),
-  }));
+  // Parse timestamp robustly: support epoch-ms (number or numeric string) and ISO strings
+  device.coords = coords.map((c) => {
+    let ts = c.timestamp;
+    let parsed;
+    // If timestamp is a numeric string or number, treat as epoch ms
+    if (ts === null || ts === undefined) {
+      parsed = new Date();
+    } else if (typeof ts === 'number') {
+      parsed = new Date(ts);
+    } else if (/^\d+$/.test(String(ts).trim())) {
+      parsed = new Date(Number(ts));
+    } else {
+      // Try parsing ISO or other date string
+      parsed = new Date(String(ts));
+      if (isNaN(parsed.getTime())) {
+        // Fallback: current time
+        parsed = new Date();
+      }
+    }
+
+    return {
+      lat: c.latitude,
+      lon: c.longitude,
+      timestamp: parsed,
+    };
+  });
   device.trailMarkers = [];
+
+  console.log(`addSummaryPoints: deviceId=${deviceId} - ${device.coords.length} coords to plot`);
+  if (device.coords.length > 0) {
+    console.log("Sample first coord:", device.coords[0]);
+    if (device.coords.length > 1) console.log("Sample last coord:", device.coords[device.coords.length - 1]);
+  }
 
   if (device.coords.length === 0) return;
 
   // Start marker
   const first = device.coords[0];
+  const startPopup = `Bắt đầu<br>${devices[deviceId]?.userName ? devices[deviceId].userName + ' — ' : ''}${deviceId}<br>${formatTimestamp(first.timestamp)}`;
   const startMarker = L.marker([first.lat, first.lon], { icon: startIcon })
     .addTo(map)
-    .bindPopup(`Bắt đầu<br>${deviceId}<br>${first.timestamp.toLocaleString()}`);
+    .bindPopup(startPopup);
   device.trailMarkers.push(startMarker);
+  summaryMarkers.push(startMarker);
+  // Open the popup for the start marker so it's visible immediately
+  try { startMarker.openPopup(); } catch (e) { /* ignore */ }
 
   // Trail
-  device.coords.forEach((c) => {
-    const m = L.circleMarker([c.lat, c.lon], { radius: 4, color: device.color });
-    m.addTo(map);
-    device.trailMarkers.push(m);
-  });
+  // If there are many coordinates, draw a simplified representation: a polyline
+  // for the full path and sampled markers to avoid performance issues.
+  const LARGE_TRACK_THRESHOLD = 3000; // if coords exceed this, simplify
+  const MAX_SAMPLE_MARKERS = 500; // max number of circle markers to draw when simplifying
+
+  if (device.coords.length > LARGE_TRACK_THRESHOLD) {
+    // Large dataset: draw only sampled markers (start, sample, end) to reduce clutter.
+    const formattedCount = device.coords.length.toLocaleString();
+    const infoMsg = `ℹ️ Dữ liệu lớn (${formattedCount} điểm) — hiển thị mẫu để cải thiện hiệu năng.`;
+    try {
+      if (window && window.showSummaryMessage) {
+        window.showSummaryMessage(infoMsg, 'info');
+      } else {
+        console.log(infoMsg);
+      }
+    } catch (e) { /* ignore */ }
+
+    // Sample markers along the path
+    const step = Math.max(1, Math.ceil(device.coords.length / MAX_SAMPLE_MARKERS));
+    for (let i = 0; i < device.coords.length; i += step) {
+      const c = device.coords[i];
+  const m = L.circleMarker([c.lat, c.lon], { radius: 4, color: device.color });
+  m.addTo(map);
+  try { m.bindPopup(`${deviceId}<br>${formatTimestamp(c.timestamp)}`); } catch (e) { /* ignore */ }
+  device.trailMarkers.push(m);
+  summaryMarkers.push(m);
+    }
+
+  } else {
+    device.coords.forEach((c) => {
+      const m = L.circleMarker([c.lat, c.lon], { radius: 4, color: device.color });
+      m.addTo(map);
+      try { m.bindPopup(`${deviceId}<br>${formatTimestamp(c.timestamp)}`); } catch (e) { /* ignore */ }
+      device.trailMarkers.push(m);
+      summaryMarkers.push(m);
+    });
+  }
 
   // End marker
   const last = device.coords[device.coords.length - 1];
+  const endPopup = `Kết thúc<br>${devices[deviceId]?.userName ? devices[deviceId].userName + ' — ' : ''}${deviceId}<br>${formatTimestamp(last.timestamp)}`;
   const endMarker = L.marker([last.lat, last.lon], { icon: endIcon })
     .addTo(map)
-    .bindPopup(`Kết thúc<br>${deviceId}<br>${last.timestamp.toLocaleString()}`);
+    .bindPopup(endPopup);
   device.trailMarkers.push(endMarker);
+  summaryMarkers.push(endMarker);
+
+  console.log(`addSummaryPoints: created ${device.trailMarkers.length} markers for device ${deviceId}`);
 
   devices[deviceId] = device;
 
   // Fit map
   const allCoords = device.coords.map((c) => [c.lat, c.lon]);
   map.fitBounds(L.latLngBounds(allCoords).pad(0.2));
+}
+
+/**
+ * Add detailed points (full markers) for a given set of coords (used for zoomed-in view)
+ */
+export function addDetailedPoints(deviceId, coords, map, maxPoints = 5000) {
+  // Clear existing detailed markers first
+  clearDetailedMarkers(map);
+
+  const toPlot = coords.slice(0, maxPoints);
+  toPlot.forEach((c) => {
+    const m = L.circleMarker([c.latitude, c.longitude], { radius: 4, color: devices[deviceId]?.color || '#3388ff' });
+    m.addTo(map);
+    try { m.bindPopup(`${devices[deviceId]?.userName ? devices[deviceId].userName + ' — ' : ''}${deviceId}<br>${formatTimestamp(c.timestamp)}`); } catch (e) { /* ignore */ }
+    detailedMarkers.push(m);
+  });
+
+  console.log(`addDetailedPoints: plotted ${detailedMarkers.length} detailed markers (capped at ${maxPoints})`);
+}
+
+export function clearDetailedMarkers(map) {
+  detailedMarkers.forEach((m) => m.remove());
+  detailedMarkers = [];
 }
 
 /**
