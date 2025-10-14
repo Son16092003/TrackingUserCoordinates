@@ -38,7 +38,7 @@ class LocationService : Service() {
         repository = LocationRepository(applicationContext)
         policyManager = PolicyManager(this)
 
-        // ✅ Khởi tạo FusedLocationProviderClient (DefaultLocationClient có fallback nội bộ)
+        // ✅ Khởi tạo FusedLocationProviderClient
         try {
             val fusedClient = LocationServices.getFusedLocationProviderClient(applicationContext)
             locationClient = DefaultLocationClient(applicationContext, fusedClient)
@@ -55,7 +55,7 @@ class LocationService : Service() {
                 repository.syncPendingLocations()
                 Log.d(TAG, "✅ Pending locations synced")
             } catch (e: Exception) {
-                Log.e(TAG, "❌ Sync failed", e)
+                Log.e(TAG, "❌ Sync failed on start", e)
                 enqueueSyncWorker()
             }
         }
@@ -103,7 +103,8 @@ class LocationService : Service() {
         val silentNotification = createSilentNotification()
         startForeground(NOTIFICATION_ID, silentNotification)
 
-        locationJob = locationClient?.getLocationUpdates(5000L)
+        // Bắt đầu nhận vị trí mỗi 5 giây
+        locationJob = locationClient?.getLocationUpdates(2000L)
             ?.catch { e ->
                 Log.e(TAG, "❌ Error receiving location: ${e.message}", e)
             }
@@ -117,17 +118,43 @@ class LocationService : Service() {
             }
     }
 
+    private var lastLocation: Location? = null // Lưu vị trí gần nhất đã gửi
+
     private suspend fun handleNewLocation(location: Location, userName: String) {
         val lat = location.latitude
         val lon = location.longitude
-        Log.d(TAG, "📍 Got location update: lat=$lat, lon=$lon")
+        val accuracy = location.accuracy
+        val timestamp = System.currentTimeMillis()
 
-        // Gửi broadcast về UI
-        sendLocationToUI(lat, lon, userName)
+        val deviceId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
 
-        // Upload hoặc lưu lại (nếu offline)
-        uploadOrSaveLocation(lat, lon, userName)
+        // ⚡ Nếu chưa có vị trí trước đó → lưu luôn
+        if (lastLocation == null) {
+            Log.d(TAG, "📍 First location fix: lat=$lat, lon=$lon, acc=$accuracy")
+            lastLocation = location
+            repository.saveOrUploadLocation(lat, lon, timestamp, deviceId, userName)
+            enqueueSyncWorker()
+            sendLocationToUI(lat, lon, userName)
+            return
+        }
+
+        // 📏 Tính khoảng cách di chuyển (m)
+        val movedDistance = lastLocation!!.distanceTo(location)
+        val threshold = maxOf(20f, 2 * accuracy)
+
+        Log.d(TAG, "📏 movedDistance=${"%.2f".format(movedDistance)}m, threshold=${"%.2f".format(threshold)}m")
+
+        // ✅ Chỉ gửi nếu di chuyển đủ xa
+        if (movedDistance >= threshold) {
+            Log.d(TAG, "✅ Significant movement detected → send location")
+            lastLocation = location
+            sendLocationToUI(lat, lon, userName)
+            uploadOrSaveLocation(lat, lon, userName)
+        } else {
+            Log.d(TAG, "⏸️ Movement below threshold (${movedDistance}m < ${threshold}m), skip upload")
+        }
     }
+
 
     private fun sendLocationToUI(lat: Double, lon: Double, userName: String) {
         val intent = Intent("LOCATION_UPDATE").apply {
@@ -150,6 +177,8 @@ class LocationService : Service() {
 
                 repository.saveOrUploadLocation(lat, lon, timestamp, deviceId, userName)
                 Log.d(TAG, "💾 Location saved/uploaded successfully")
+
+                // 🔁 Worker mới sẽ thay thế worker cũ → tránh delay, đảm bảo realtime
                 enqueueSyncWorker()
             } catch (e: Exception) {
                 Log.e(TAG, "❌ Save/upload failed", e)
@@ -183,6 +212,12 @@ class LocationService : Service() {
             .build()
     }
 
+    /**
+     * ✅ Worker an toàn và realtime:
+     * - REPLACE: luôn chạy job mới nhất (job cũ hủy nhưng dữ liệu vẫn lưu Room)
+     * - LINEAR backoff: retry đều đặn mỗi phút
+     * - Tự chạy lại khi có mạng
+     */
     private fun enqueueSyncWorker() {
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
@@ -191,19 +226,19 @@ class LocationService : Service() {
         val request = OneTimeWorkRequestBuilder<LocationSyncWorker>()
             .setConstraints(constraints)
             .setBackoffCriteria(
-                BackoffPolicy.EXPONENTIAL,
-                15,
+                BackoffPolicy.LINEAR,
+                1,
                 java.util.concurrent.TimeUnit.MINUTES
             )
             .build()
 
         WorkManager.getInstance(applicationContext).enqueueUniqueWork(
             "LocationSyncWork",
-            ExistingWorkPolicy.KEEP,
+            ExistingWorkPolicy.REPLACE, // ⚡ realtime, không mất dữ liệu
             request
         )
 
-        Log.d(TAG, "✅ SyncWorker enqueued id=${request.id}")
+        Log.d(TAG, "✅ SyncWorker enqueued (auto-trigger on network available)")
     }
 
     companion object {

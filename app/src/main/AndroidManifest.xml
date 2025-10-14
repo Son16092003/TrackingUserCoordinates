@@ -6,30 +6,29 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-
-    <!-- Quyền bắt buộc cho background tracking -->
     <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
 
-    <!-- Quyền cho Foreground Service (Android 12+) -->
+    <!-- Foreground Service (Android 12+ & 14+) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
-    <!-- Cho phép gửi notification (Android 13+) -->
+    <!-- Notification (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Cho phép restart khi boot -->
+    <!-- Tự khởi động khi reboot -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:name=".LocationApp"
         android:allowBackup="false"
+        android:persistent="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.Light.NoActionBar">
 
-        <!-- MainActivity: chỉ hiển thị khi cần nhập userName -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -41,24 +40,26 @@
             </intent-filter>
         </activity>
 
-        <!-- Service tracking -->
+        <!-- Service -->
         <service
             android:name=".LocationService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="location" />
+            android:stopWithTask="false"
+            android:foregroundServiceType="location|dataSync" />
 
-        <!-- RestartReceiver: kiểm tra userName và start service hoặc MainActivity sau boot -->
+        <!-- Receiver -->
         <receiver
             android:name=".RestartReceiver"
             android:enabled="true"
-            android:exported="true">
+            android:exported="true"
+            android:directBootAware="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
 
-        <!-- DeviceAdminReceiver -->
+        <!-- Device Admin -->
         <receiver
             android:name=".admin.MyDeviceAdminReceiver"
             android:permission="android.permission.BIND_DEVICE_ADMIN"
